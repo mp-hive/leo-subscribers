@@ -35,6 +35,7 @@ class HiveMonitor {
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
     this.reconnectDelay = 5000; // 5 seconds
+    this.lastConnectionState = false; // Track connection state changes
 
     this.circuitBreaker = new CircuitBreaker({
       name: 'hive-connection',
@@ -48,7 +49,19 @@ class HiveMonitor {
       delay: 5000,
       backoffFactor: 1.5
     });
+
+    // Only log when connection state changes
+    setInterval(() => {
+      if (this.isConnected !== this.lastConnectionState) {
+        logger.info('Connection state changed', { 
+          connected: this.isConnected,
+          attempts: this.reconnectAttempts
+        });
+        this.lastConnectionState = this.isConnected;
+      }
+    }, 60000); // Check every minute instead of every 30 seconds
   }
+
 
   async connect() {
     if (this.isConnected) {
@@ -97,49 +110,82 @@ class HiveMonitor {
       await this.connect();
     }
 
-    this.observer = this.bot.observe.accountOperations(SUBSCRIPTION_PAYMENT_ACCOUNT);
-    
-    this.observer.subscribe({
-      next: async (operation) => {
-        try {
-          await this.processOperation(operation);
-        } catch (error) {
-          logger.error('Error processing operation:', { error: error.message });
-        }
-      },
-      error: (error) => {
-        logger.error('Observer error:', { error: error.message });
-        this.handleDisconnect();
-      },
-      complete: () => {
-        logger.info('Observer completed');
+    try {
+      this.observer = this.bot.observe.accountOperations(SUBSCRIPTION_PAYMENT_ACCOUNT);
+      
+      if (!this.observer) {
+        throw new Error('Failed to create observer');
       }
-    });
-    
-    logger.info('Real-time monitoring started');
-  }
+      
+      this.observer.subscribe({
+        next: async (operation) => {
+          // Skip logging the raw operation
+          try {
+            await this.processOperation(operation);
+          } catch (error) {
+            logger.error('Error processing operation:', { error: error.message });
+          }
+        },
+        error: (error) => {
+          logger.error('Observer error:', { error: error.message });
+          this.handleDisconnect();
+        },
+        complete: () => {
+          logger.info('Observer completed');
+        }
+      });
+      
+      logger.info('Real-time monitoring started');
+    } catch (error) {
+      logger.error('Error setting up monitoring:', { error: error.message });
+      throw error;
+    }
+}
 
-  async processOperation(operation) {
-    return this.retry.execute(async () => {
-      if (operation[0] === 'transfer' && 
-          operation[1].to === SUBSCRIPTION_PAYMENT_ACCOUNT &&
-          operation[1].amount.includes(`${SUBSCRIPTION_AMOUNT}.000 HBD`) &&
-          operation[1].memo.toLowerCase() === `subscribe:${SUBSCRIPTION_ACCOUNT}`) {
+async processOperation(operation) {
+  return this.retry.execute(async () => {
+    if (operation.op.transfer) {
+      const transfer = operation.op.transfer;
+      const blockTime = operation.transaction.block.block.timestamp;
+      
+      // Convert amount to number for comparison
+      const transferAmount = parseInt(transfer.amount.amount, 10);
+      const expectedAmount = SUBSCRIPTION_AMOUNT * 1000;
+
+      if (transfer.to_account === SUBSCRIPTION_PAYMENT_ACCOUNT &&
+          transfer.amount.nai === '@@000000013' &&
+          transferAmount === expectedAmount &&
+          transfer.memo.toLowerCase() === `subscribe:${SUBSCRIPTION_ACCOUNT}`) {
         
-        const transfer = {
-          from: operation[1].from,
-          amount: operation[1].amount,
-          timestamp: operation[1].timestamp
+        // Only log when we find a relevant transfer
+        console.log('Subscription transfer detected:', {
+          from: transfer.from_account,
+          amount: `${SUBSCRIPTION_AMOUNT}.000 HBD`,
+          memo: transfer.memo
+        });
+        
+        const txTransfer = {
+          from: transfer.from_account,
+          amount: `${SUBSCRIPTION_AMOUNT}.000 HBD`,
+          timestamp: blockTime
         };
         
-        await processSubscriptionTransfer(transfer);
-        logger.info('Successfully processed transfer', { 
-          from: transfer.from, 
-          amount: transfer.amount 
-        });
+        try {
+          await processSubscriptionTransfer(txTransfer);
+          logger.info('Subscription processed successfully', { 
+            username: transfer.from_account,
+            timestamp: blockTime
+          });
+        } catch (error) {
+          logger.error('Failed to process subscription:', {
+            error: error.message,
+            transfer: txTransfer
+          });
+        }
       }
-    });
-  }
+    }
+  });
+}
 
   async stop() {
     try {
@@ -252,8 +298,17 @@ async function findTransactions() {
 
   async function processSubscriptionTransfer(transfer) {
     const { from, amount, timestamp } = transfer;
-    const subscriptionDate = DateTime.fromISO(timestamp);
+    
+    // Ensure proper DateTime parsing and formatting
+    const subscriptionDate = DateTime.fromISO(timestamp, { zone: 'UTC' });
     const expirationDate = subscriptionDate.plus({ days: 31 });
+
+    // Debug log the exact values we're trying to insert
+    console.log('Attempting database insert:', {
+        username: from,
+        subscriptionDate: subscriptionDate.toSQL({ includeOffset: false }),
+        expirationDate: expirationDate.toSQL({ includeOffset: false })
+    });
   
     try {
       const query = `
@@ -266,32 +321,46 @@ async function findTransactions() {
           date_updated = CURRENT_TIMESTAMP,
           active_subscription = TRUE
         WHERE subscriptions.expiration_date < EXCLUDED.expiration_date
+        RETURNING id, username, subscription_date, expiration_date
       `;
       
-      await db.query(query, [
+      const result = await db.query(query, [
         from, 
         subscriptionDate.toJSDate(),
         expirationDate.toJSDate()
       ]);
       
-      logger.info('Processed subscription', { 
-        username: from,
-        subscriptionDate: subscriptionDate.toISO(),
-        expirationDate: expirationDate.toISO(),
-        amount: amount
-      });
+      if (result.rows.length > 0) {
+        console.log('Successfully added/updated subscription:', result.rows[0]);
+        logger.info('Subscription processed', { 
+          username: from,
+          subscriptionDate: subscriptionDate.toISO(),
+          expirationDate: expirationDate.toISO(),
+          amount: amount
+        });
+      } else {
+        console.log('No update performed - existing subscription is newer');
+        logger.warn('No update needed', {
+          username: from,
+          attempted_date: subscriptionDate.toISO()
+        });
+      }
 
     } catch (error) {
-      logger.error('Error processing subscription:', { 
-        error: error.message,
-        username: from,
+      console.error('Database error:', {
+        message: error.message,
         code: error.code,
-        timestamp: timestamp
+        username: from,
+        subscription_date: subscriptionDate.toISO(),
+        expiration_date: expirationDate.toISO()
       });
-
-      if (error.code === '42P10') {
-        logger.error('Database schema needs to be updated with UNIQUE constraint on username');
-      }
+      
+      logger.error('Database error:', { 
+        error: error.message,
+        code: error.code,
+        username: from
+      });
+      throw error;
     }
 }
 
