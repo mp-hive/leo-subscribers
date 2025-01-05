@@ -109,83 +109,114 @@ class HiveMonitor {
     if (!this.isConnected || !this.bot) {
       await this.connect();
     }
-
-    try {
-      this.observer = this.bot.observe.accountOperations(SUBSCRIPTION_PAYMENT_ACCOUNT);
-      
-      if (!this.observer) {
-        throw new Error('Failed to create observer');
-      }
-      
-      this.observer.subscribe({
-        next: async (operation) => {
-          // Skip logging the raw operation
-          try {
-            await this.processOperation(operation);
-          } catch (error) {
-            logger.error('Error processing operation:', { error: error.message });
-          }
-        },
-        error: (error) => {
-          logger.error('Observer error:', { error: error.message });
-          this.handleDisconnect();
-        },
-        complete: () => {
-          logger.info('Observer completed');
+  
+    // Create observers for both accounts
+    const subscriptionObserver = this.bot.observe.accountOperations(process.env.SUBSCRIPTION_PAYMENT_ACCOUNT);
+    const aiObserver = this.bot.observe.accountOperations(process.env.AI_PAYMENT_ACCOUNT);
+    
+    const observerHandler = {
+      next: async (operation) => {
+        try {
+          await this.processOperation(operation);
+        } catch (error) {
+          logger.error('Error processing operation:', { error: error.message });
         }
-      });
-      
-      logger.info('Real-time monitoring started');
-    } catch (error) {
-      logger.error('Error setting up monitoring:', { error: error.message });
-      throw error;
-    }
-}
-
-async processOperation(operation) {
-  return this.retry.execute(async () => {
-    if (operation.op.transfer) {
+      },
+      error: (error) => {
+        logger.error('Observer error:', { error: error.message });
+        this.handleDisconnect();
+      },
+      complete: () => {
+        logger.info('Observer completed');
+      }
+    };
+  
+    // Subscribe both observers
+    subscriptionObserver.subscribe(observerHandler);
+    aiObserver.subscribe(observerHandler);
+    
+    logger.info('Real-time monitoring started for all accounts');
+  }
+  
+  async processOperation(operation) {
+    return this.retry.execute(async () => {
+      if (!operation.op || !operation.op.transfer) {
+        return; // Not a transfer operation
+      }
+  
       const transfer = operation.op.transfer;
       const blockTime = operation.transaction.block.block.timestamp;
       
-      // Convert amount to number for comparison
-      const transferAmount = parseInt(transfer.amount.amount, 10);
-      const expectedAmount = SUBSCRIPTION_AMOUNT * 1000;
-
-      if (transfer.to_account === SUBSCRIPTION_PAYMENT_ACCOUNT &&
-          transfer.amount.nai === '@@000000013' &&
-          transferAmount === expectedAmount &&
-          transfer.memo.toLowerCase() === `subscribe:${SUBSCRIPTION_ACCOUNT}`) {
+      // Transform the transfer data to a consistent format
+      const transformedTransfer = {
+        from: transfer.from_account,
+        to: transfer.to_account,
+        amount: {
+          amount: parseFloat(transfer.amount.amount) / 1000, // Convert from millihive to hive
+          symbol: 'HBD'
+        },
+        memo: transfer.memo,
+        timestamp: blockTime
+      };
+  
+      // Handle AI Summaries transfers
+      if (transfer.to_account === process.env.AI_PAYMENT_ACCOUNT &&
+          transfer.amount.nai === '@@000000013') {
         
-        // Only log when we find a relevant transfer
-        console.log('Subscription transfer detected:', {
+        const transferAmount = parseFloat(transfer.amount.amount) / 1000;
+        
+        if (transferAmount === Number(process.env.AI_SUBSCRIPTION_FULL_AMOUNT) || 
+            transferAmount === Number(process.env.AI_SUBSCRIPTION_MINI_AMOUNT)) {
+          
+          logger.info('AI Summaries transfer detected:', {
+            from: transfer.from_account,
+            amount: transferAmount,
+            memo: transfer.memo
+          });
+          
+          try {
+            await processSubscriptionTransfer(transformedTransfer);
+            logger.info('AI Subscription processed successfully', {
+              username: transfer.from_account,
+              amount: transferAmount,
+              timestamp: blockTime
+            });
+          } catch (error) {
+            logger.error('Failed to process AI subscription:', {
+              error: error.message,
+              transfer: transformedTransfer
+            });
+          }
+        }
+      }
+      
+      // Handle regular subscription transfers
+      else if (transfer.to_account === process.env.SUBSCRIPTION_PAYMENT_ACCOUNT &&
+               transfer.amount.nai === '@@000000013' &&
+               parseFloat(transfer.amount.amount) / 1000 === Number(process.env.SUBSCRIPTION_AMOUNT) &&
+               transfer.memo.toLowerCase() === `subscribe:${process.env.SUBSCRIPTION_ACCOUNT.toLowerCase()}`) {
+        
+        logger.info('Subscription transfer detected:', {
           from: transfer.from_account,
-          amount: `${SUBSCRIPTION_AMOUNT}.000 HBD`,
+          amount: `${process.env.SUBSCRIPTION_AMOUNT}.000 HBD`,
           memo: transfer.memo
         });
         
-        const txTransfer = {
-          from: transfer.from_account,
-          amount: `${SUBSCRIPTION_AMOUNT}.000 HBD`,
-          timestamp: blockTime
-        };
-        
         try {
-          await processSubscriptionTransfer(txTransfer);
-          logger.info('Subscription processed successfully', { 
+          await processSubscriptionTransfer(transformedTransfer);
+          logger.info('Subscription processed successfully', {
             username: transfer.from_account,
             timestamp: blockTime
           });
         } catch (error) {
           logger.error('Failed to process subscription:', {
             error: error.message,
-            transfer: txTransfer
+            transfer: transformedTransfer
           });
         }
       }
-    }
-  });
-}
+    });
+  }
 
   async stop() {
     try {
@@ -218,152 +249,207 @@ async processOperation(operation) {
 export default HiveMonitor;
 
 async function findTransactions() {
-    console.log('Starting search for transactions...');
-    
-    const endDate = DateTime.now();
-    const startDate = endDate.minus({ days: 31 });
-    
-    console.log('Looking for transfers to', SUBSCRIPTION_PAYMENT_ACCOUNT + ':');
-    console.log(`- Memo: "subscribe:${SUBSCRIPTION_ACCOUNT}"`);
-    console.log(`- Amount: ${SUBSCRIPTION_AMOUNT}.000 HBD`);
+  console.log('Starting search for transactions...');
+  const endDate = DateTime.now();
+  const startDate = endDate.minus({ days: 31 });
+
+  // Define the accounts and amounts to check
+  const checkParams = [
+    {
+      account: process.env.SUBSCRIPTION_PAYMENT_ACCOUNT,
+      amount: process.env.SUBSCRIPTION_AMOUNT,
+      requireMemo: true,
+      memoText: `subscribe:${process.env.SUBSCRIPTION_ACCOUNT}`
+    },
+    {
+      account: process.env.AI_PAYMENT_ACCOUNT,
+      amount: process.env.AI_SUBSCRIPTION_FULL_AMOUNT,
+      requireMemo: false
+    },
+    {
+      account: process.env.AI_PAYMENT_ACCOUNT,
+      amount: process.env.AI_SUBSCRIPTION_MINI_AMOUNT,
+      requireMemo: false
+    }
+  ];
+
+  for (const params of checkParams) {
+    console.log(`\nLooking for transfers to ${params.account}:`);
+    if (params.requireMemo) {
+      console.log(`- Memo: "${params.memoText}"`);
+    }
+    // Format amount to always have 3 decimal places
+    const formattedAmount = Number(params.amount).toFixed(3);
+    console.log(`- Amount: ${formattedAmount} HBD`);
     console.log('- Time range:', startDate.toISODate(), 'to', endDate.toISODate());
-  
+
     try {
-      const response = await fetch(`https://${HIVE_API_NODE}`, {
+      const response = await fetch(`https://${process.env.HIVE_API_NODE}`, {
         method: 'POST',
         body: JSON.stringify({
           jsonrpc: '2.0',
           method: 'condenser_api.get_account_history',
-          params: [SUBSCRIPTION_PAYMENT_ACCOUNT, -1, 1000],
+          params: [params.account, -1, 1000],
           id: 1
         }),
         headers: { 'Content-Type': 'application/json' }
       });
-  
+
       const data = await response.json();
       if (data.error) {
         throw new Error(data.error.message);
       }
-  
       if (!Array.isArray(data.result)) {
         throw new Error('Unexpected API response format');
       }
-  
+
       console.log(`Fetched ${data.result.length} operations`);
-  
       const validTransfers = [];
-      
+
       for (const operation of data.result) {
-        // Each operation is an array where operation[1] contains the actual operation data
         const [trx_id, { op, timestamp }] = operation;
-        
-        // op[0] is operation type, op[1] contains operation data
         const [op_type, op_data] = op;
-        
+
         if (op_type === 'transfer') {
           const { from, to, amount, memo } = op_data;
           const txTimestamp = DateTime.fromISO(timestamp);
-          
-          if (to === SUBSCRIPTION_PAYMENT_ACCOUNT &&
-              amount === `${SUBSCRIPTION_AMOUNT}.000 HBD` &&
-              memo.toLowerCase() === `subscribe:${SUBSCRIPTION_ACCOUNT}` &&
-              txTimestamp >= startDate &&
-              txTimestamp <= endDate) {
-            
-            validTransfers.push({
+
+          const isValidTransfer = to === params.account &&
+            amount === `${formattedAmount} HBD` &&
+            txTimestamp >= startDate &&
+            txTimestamp <= endDate;
+
+          // Additional memo check only if required
+          const isValidMemo = params.requireMemo ? 
+            memo.toLowerCase() === params.memoText : 
+            true;
+
+          if (isValidTransfer && isValidMemo) {
+            // Transform the transfer data to match the expected format
+            const transformedTransfer = {
               from,
-              amount,
-              timestamp,
-              block_num: trx_id
-            });
+              to,
+              amount: {
+                amount: parseFloat(amount.split(' ')[0]),
+                symbol: 'HBD'
+              },
+              memo,
+              timestamp
+            };
+
+            validTransfers.push(transformedTransfer);
           }
         }
       }
-  
+
       console.log('\nValid Transfers:');
       for (const transfer of validTransfers) {
         console.log(transfer);
-        await processSubscriptionTransfer(transfer);
+        const result = await processSubscriptionTransfer(transfer);
+        if (!result) {
+          logger.error('Failed to process transfer:', { transfer });
+        }
       }
-  
       console.log('\nTotal valid transfers found:', validTransfers.length);
-      console.log('Search completed');
-      
+
     } catch (error) {
       console.error('Error fetching transactions:', error);
       throw error;
     }
   }
+
+  console.log('\nSearch completed');
+}
   
+async function processSubscriptionTransfer(transfer) {
+  const {
+    from: sender,
+    to: recipient,
+    amount: { amount: value, symbol },
+    memo
+  } = transfer;
 
-  async function processSubscriptionTransfer(transfer) {
-    const { from, amount, timestamp } = transfer;
-    
-    // Ensure proper DateTime parsing and formatting
-    const subscriptionDate = DateTime.fromISO(timestamp, { zone: 'UTC' });
-    const expirationDate = subscriptionDate.plus({ days: 31 });
-
-    // Debug log the exact values we're trying to insert
-    console.log('Attempting database insert:', {
-        username: from,
-        subscriptionDate: subscriptionDate.toSQL({ includeOffset: false }),
-        expirationDate: expirationDate.toSQL({ includeOffset: false })
-    });
-  
-    try {
-      const query = `
-        INSERT INTO subscriptions (username, subscription_date, expiration_date)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (username) 
-        DO UPDATE SET 
-          subscription_date = EXCLUDED.subscription_date,
-          expiration_date = EXCLUDED.expiration_date,
-          date_updated = CURRENT_TIMESTAMP,
-          active_subscription = TRUE
-        WHERE subscriptions.expiration_date < EXCLUDED.expiration_date
-        RETURNING id, username, subscription_date, expiration_date
-      `;
-      
-      const result = await db.query(query, [
-        from, 
-        subscriptionDate.toJSDate(),
-        expirationDate.toJSDate()
-      ]);
-      
-      if (result.rows.length > 0) {
-        console.log('Successfully added/updated subscription:', result.rows[0]);
-        logger.info('Subscription processed', { 
-          username: from,
-          subscriptionDate: subscriptionDate.toISO(),
-          expirationDate: expirationDate.toISO(),
-          amount: amount
-        });
-      } else {
-        console.log('No update performed - existing subscription is newer');
-        logger.warn('No update needed', {
-          username: from,
-          attempted_date: subscriptionDate.toISO()
-        });
-      }
-
-    } catch (error) {
-      console.error('Database error:', {
-        message: error.message,
-        code: error.code,
-        username: from,
-        subscription_date: subscriptionDate.toISO(),
-        expiration_date: expirationDate.toISO()
+  // Handle AI Summaries transfers
+  if (recipient === process.env.AI_PAYMENT_ACCOUNT && symbol === 'HBD') {
+    let days = 0;
+    if (value === Number(process.env.AI_SUBSCRIPTION_FULL_AMOUNT)) {
+      days = Number(process.env.AI_SUBSCRIPTION_FULL_DAYS);
+      logger.info('AI Summaries full subscription payment received', {
+        sender,
+        amount: value,
+        days
       });
-      
-      logger.error('Database error:', { 
-        error: error.message,
-        code: error.code,
-        username: from
+      return await addSubscription(sender, days);
+    } else if (value === Number(process.env.AI_SUBSCRIPTION_MINI_AMOUNT)) {
+      days = Number(process.env.AI_SUBSCRIPTION_MINI_DAYS);
+      logger.info('AI Summaries mini subscription payment received', {
+        sender,
+        amount: value,
+        days
       });
-      throw error;
+      return await addSubscription(sender, days);
     }
+  }
+
+  // Handle original subscription logic
+  if (recipient === process.env.SUBSCRIPTION_PAYMENT_ACCOUNT && 
+      value === Number(process.env.SUBSCRIPTION_AMOUNT) && 
+      symbol === 'HBD') {
+    
+    const memoMatch = memo.match(/^subscribe:(\w+)$/);
+    if (!memoMatch) {
+      return false;
+    }
+
+    const subscribingAccount = memoMatch[1].toLowerCase();
+    if (subscribingAccount !== process.env.SUBSCRIPTION_ACCOUNT.toLowerCase()) {
+      return false;
+    }
+
+    logger.info('Standard subscription payment received', {
+      sender,
+      amount: value,
+      days: 31
+    });
+
+    return await addSubscription(sender, 31);
+  }
+
+  return false;
 }
 
+async function addSubscription(username, days) {
+  const subscriptionDate = new Date();
+  const expirationDate = new Date(subscriptionDate);
+  expirationDate.setDate(expirationDate.getDate() + days);
+
+  try {
+    const query = `
+      INSERT INTO subscriptions (username, subscription_date, expiration_date)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (username) 
+      DO UPDATE SET 
+        expiration_date = CASE
+          WHEN subscriptions.expiration_date > CURRENT_TIMESTAMP 
+          THEN subscriptions.expiration_date + INTERVAL '${days} days'
+          ELSE CURRENT_TIMESTAMP + INTERVAL '${days} days'
+        END,
+        date_updated = CURRENT_TIMESTAMP,
+        active_subscription = TRUE
+    `;
+    
+    await db.query(query, [username, subscriptionDate, expirationDate]);
+    
+    return true;
+  } catch (error) {
+    logger.error('Error adding subscription:', {
+      error: error.message,
+      username,
+      days
+    });
+    return false;
+  }
+}
 
 // Add shutdown handling
 async function shutdown() {
@@ -440,8 +526,13 @@ async function main() {
     global.healthCheck = new HealthCheck();
     await global.healthCheck.start();
 
-    // First, process historical transactions
-    await findTransactions();
+    // Create monitor first
+    monitor = new HiveMonitor();
+    await monitor.connect();  // This initializes the client
+    global.monitor = monitor;
+
+    // Now pass the client to findTransactions
+    await findTransactions(monitor.client);
     
     // Start periodic checks for expired subscriptions
     const checkInterval = 60 * 60 * 1000; // 1 hour
@@ -457,8 +548,7 @@ async function main() {
     await periodicCheck(); // Initial check
     
     // Then start real-time monitoring
-    monitor = await startRealTimeMonitoring();
-    global.monitor = monitor; // Make monitor globally accessible for health checks
+    await monitor.startMonitoring();
   } catch (error) {
     console.error('Error in main execution:', error);
     if (monitor) {
