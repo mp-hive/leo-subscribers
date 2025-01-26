@@ -424,21 +424,49 @@ async function addSubscription(username, days) {
   expirationDate.setDate(expirationDate.getDate() + days);
 
   try {
+    // Check if the user already has an active subscription
+    const existingSubscription = await db.query(
+      'SELECT subscription_date, expiration_date FROM subscriptions WHERE username = $1',
+      [username]
+    );
+
+    if (existingSubscription.rows.length > 0) {
+      const currentSubscriptionDate = new Date(existingSubscription.rows[0].subscription_date);
+      const currentExpirationDate = new Date(existingSubscription.rows[0].expiration_date);
+
+      // Only update the expiration_date if the new subscription_date is after the current expiration_date
+      if (subscriptionDate > currentExpirationDate) {
+        expirationDate.setDate(subscriptionDate.getDate() + days);
+      } else {
+        // If the subscription is still active, do not add additional days
+        logger.info('Subscription is still active; no additional days added', {
+          username,
+          currentExpirationDate,
+          newSubscriptionDate: subscriptionDate
+        });
+        return true; // Return true to indicate no error, but no action was taken
+      }
+    }
+
+    // Insert or update the subscription
     const query = `
       INSERT INTO subscriptions (username, subscription_date, expiration_date)
       VALUES ($1, $2, $3)
       ON CONFLICT (username) 
       DO UPDATE SET 
-        expiration_date = CASE
-          WHEN subscriptions.expiration_date > CURRENT_TIMESTAMP 
-          THEN subscriptions.expiration_date + INTERVAL '${days} days'
-          ELSE CURRENT_TIMESTAMP + INTERVAL '${days} days'
-        END,
+        subscription_date = $2,
+        expiration_date = $3,
         date_updated = CURRENT_TIMESTAMP,
         active_subscription = TRUE
     `;
     
     await db.query(query, [username, subscriptionDate, expirationDate]);
+    
+    logger.info('Subscription added or updated successfully', {
+      username,
+      subscriptionDate,
+      expirationDate
+    });
     
     return true;
   } catch (error) {
