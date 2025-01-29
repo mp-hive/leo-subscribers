@@ -140,79 +140,69 @@ class HiveMonitor {
   
   async processOperation(operation) {
     return this.retry.execute(async () => {
-      if (!operation.op || !operation.op.transfer) {
-        return; // Not a transfer operation
+      // Skip if not an array operation
+      if (!Array.isArray(operation.op)) {
+        return;
       }
   
-      const transfer = operation.op.transfer;
-      const blockTime = operation.transaction.block.block.timestamp;
+      const [opType, opData] = operation.op;
       
-      // Transform the transfer data to a consistent format
-      const transformedTransfer = {
-        from: transfer.from_account,
-        to: transfer.to_account,
-        amount: {
-          amount: parseFloat(transfer.amount.amount) / 1000, // Convert from millihive to hive
-          symbol: 'HBD'
-        },
-        memo: transfer.memo,
-        timestamp: blockTime
-      };
+      // Check both regular and recurring transfers
+      if ((opType === 'transfer' || opType === 'fill_recurrent_transfer') && 
+          (opData.to === process.env.SUBSCRIPTION_PAYMENT_ACCOUNT || 
+           opData.to === process.env.AI_PAYMENT_ACCOUNT)) {
+        
+        const [amountValue, symbol] = opData.amount.split(' ');
+        const transferAmount = parseFloat(amountValue);
   
-      // Handle AI Summaries transfers
-      if (transfer.to_account === process.env.AI_PAYMENT_ACCOUNT &&
-          transfer.amount.nai === '@@000000013') {
-        
-        const transferAmount = parseFloat(transfer.amount.amount) / 1000;
-        
-        if (transferAmount === Number(process.env.AI_SUBSCRIPTION_FULL_AMOUNT) || 
-            transferAmount === Number(process.env.AI_SUBSCRIPTION_MINI_AMOUNT)) {
-          
-          logger.info('AI Summaries transfer detected:', {
-            from: transfer.from_account,
+        logger.debug(`${opType} detected:`, {
+          from: opData.from,
+          to: opData.to,
+          amount: opData.amount,
+          memo: opData.memo,
+          type: opType
+        });
+  
+        const transformedTransfer = {
+          from: opData.from,
+          to: opData.to,
+          amount: {
             amount: transferAmount,
-            memo: transfer.memo
-          });
-          
+            symbol: 'HBD'
+          },
+          memo: opData.memo,
+          timestamp: operation.timestamp
+        };
+  
+        // Handle AI Summaries transfers
+        if (opData.to === process.env.AI_PAYMENT_ACCOUNT && 
+            symbol === 'HBD') {
+          if (transferAmount === Number(process.env.AI_SUBSCRIPTION_FULL_AMOUNT) || 
+              transferAmount === Number(process.env.AI_SUBSCRIPTION_MINI_AMOUNT)) {
+            try {
+              await processSubscriptionTransfer(transformedTransfer);
+            } catch (error) {
+              logger.error('Failed to process AI subscription:', {
+                error: error.message,
+                transfer: transformedTransfer
+              });
+            }
+          }
+        }
+        
+        // Handle regular subscription transfers
+        else if (opData.to === process.env.SUBSCRIPTION_PAYMENT_ACCOUNT && 
+                 transferAmount === Number(process.env.SUBSCRIPTION_AMOUNT) && 
+                 symbol === 'HBD' &&
+                 opData.memo.toLowerCase() === `subscribe:${process.env.SUBSCRIPTION_ACCOUNT.toLowerCase()}`) {
           try {
             await processSubscriptionTransfer(transformedTransfer);
-            logger.info('AI Subscription processed successfully', {
-              username: transfer.from_account,
-              amount: transferAmount,
-              timestamp: blockTime
-            });
           } catch (error) {
-            logger.error('Failed to process AI subscription:', {
+            logger.error('Failed to process subscription:', {
               error: error.message,
               transfer: transformedTransfer
             });
           }
-        }
-      }
-      
-      // Handle regular subscription transfers
-      else if (transfer.to_account === process.env.SUBSCRIPTION_PAYMENT_ACCOUNT &&
-               transfer.amount.nai === '@@000000013' &&
-               parseFloat(transfer.amount.amount) / 1000 === Number(process.env.SUBSCRIPTION_AMOUNT) &&
-               transfer.memo.toLowerCase() === `subscribe:${process.env.SUBSCRIPTION_ACCOUNT.toLowerCase()}`) {
-        
-        logger.info('Subscription transfer detected:', {
-          from: transfer.from_account,
-          amount: `${process.env.SUBSCRIPTION_AMOUNT}.000 HBD`,
-          memo: transfer.memo
-        });
-        
-        try {
-          await processSubscriptionTransfer(transformedTransfer);
-          logger.info('Subscription processed successfully', {
-            username: transfer.from_account,
-            timestamp: blockTime
-          });
-        } catch (error) {
-          logger.error('Failed to process subscription:', {
-            error: error.message,
-            transfer: transformedTransfer
-          });
         }
       }
     });
@@ -278,7 +268,6 @@ async function findTransactions() {
     if (params.requireMemo) {
       console.log(`- Memo: "${params.memoText}"`);
     }
-    // Format amount to always have 3 decimal places
     const formattedAmount = Number(params.amount).toFixed(3);
     console.log(`- Amount: ${formattedAmount} HBD`);
     console.log('- Time range:', startDate.toISODate(), 'to', endDate.toISODate());
@@ -308,32 +297,39 @@ async function findTransactions() {
 
       for (const operation of data.result) {
         const [trx_id, { op, timestamp }] = operation;
-        const [op_type, op_data] = op;
-
-        if (op_type === 'transfer') {
-          const { from, to, amount, memo } = op_data;
-          const txTimestamp = DateTime.fromISO(timestamp);
-
-          const isValidTransfer = to === params.account &&
-            amount === `${formattedAmount} HBD` &&
-            txTimestamp >= startDate &&
-            txTimestamp <= endDate;
+        
+        // Skip if not an array operation
+        if (!Array.isArray(op)) continue;
+        
+        const [opType, opData] = op;
+        
+        // Check both regular and recurring transfers
+        if ((opType === 'transfer' || opType === 'fill_recurrent_transfer') && 
+            opData.to === params.account) {
+          
+          const [amountValue, symbol] = opData.amount.split(' ');
+          const transferAmount = parseFloat(amountValue);
+          
+          const isValidTransfer = 
+            transferAmount === Number(params.amount) &&
+            symbol === 'HBD' &&
+            DateTime.fromISO(timestamp) >= startDate &&
+            DateTime.fromISO(timestamp) <= endDate;
 
           // Additional memo check only if required
           const isValidMemo = params.requireMemo ? 
-            memo.toLowerCase() === params.memoText : 
+            opData.memo.toLowerCase() === params.memoText.toLowerCase() : 
             true;
 
           if (isValidTransfer && isValidMemo) {
-            // Transform the transfer data to match the expected format
             const transformedTransfer = {
-              from,
-              to,
+              from: opData.from,
+              to: opData.to,
               amount: {
-                amount: parseFloat(amount.split(' ')[0]),
+                amount: transferAmount,
                 symbol: 'HBD'
               },
-              memo,
+              memo: opData.memo,
               timestamp
             };
 
@@ -350,7 +346,7 @@ async function findTransactions() {
           logger.error('Failed to process transfer:', { transfer });
         }
       }
-      console.log('\nTotal valid transfers found:', validTransfers.length);
+      console.log('Total valid transfers found:', validTransfers.length);
 
     } catch (error) {
       console.error('Error fetching transactions:', error);
@@ -585,6 +581,5 @@ async function main() {
     throw error;
   }
 }
-
 
 main();
