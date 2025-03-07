@@ -416,8 +416,7 @@ async function processSubscriptionTransfer(transfer) {
 
 async function addSubscription(username, days) {
   const subscriptionDate = new Date();
-  const expirationDate = new Date(subscriptionDate);
-  expirationDate.setDate(expirationDate.getDate() + days);
+  let expirationDate;
 
   try {
     // Check if the user already has an active subscription
@@ -427,14 +426,10 @@ async function addSubscription(username, days) {
     );
 
     if (existingSubscription.rows.length > 0) {
-      const currentSubscriptionDate = new Date(existingSubscription.rows[0].subscription_date);
       const currentExpirationDate = new Date(existingSubscription.rows[0].expiration_date);
-
-      // Only update the expiration_date if the new subscription_date is after the current expiration_date
-      if (subscriptionDate > currentExpirationDate) {
-        expirationDate.setDate(subscriptionDate.getDate() + days);
-      } else {
-        // If the subscription is still active, do not add additional days
+      
+      // If the current date is before the current expiration date, the subscription is still active
+      if (subscriptionDate < currentExpirationDate) {
         logger.info('Subscription is still active; no additional days added', {
           username,
           currentExpirationDate,
@@ -443,6 +438,10 @@ async function addSubscription(username, days) {
         return true; // Return true to indicate no error, but no action was taken
       }
     }
+
+    // Calculate expiration date only once - add days to the current date
+    expirationDate = new Date(subscriptionDate);
+    expirationDate.setDate(expirationDate.getDate() + days);
 
     // Insert or update the subscription
     const query = `
