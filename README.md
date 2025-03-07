@@ -90,8 +90,8 @@ WorkingDirectory=/home/YOUR_USERNAME/leo-subscribers
 ExecStart=/usr/bin/node monitor-subscriptions.js
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/subscription-tracker/output.log
-StandardError=append:/var/log/subscription-tracker/error.log
+StandardOutput=append:/var/log/services/subtracker.log
+StandardError=append:/var/log/services/subtracker.log
 
 # Environment variables from .env
 EnvironmentFile=/home/YOUR_USERNAME/leo-subscribers/.env
@@ -102,7 +102,7 @@ WantedBy=multi-user.target
 Create the log directory and set permissions:
 ```
 sudo mkdir -p /var/log/subscription-tracker
-sudo chown YOUR_USERNAME:YOUR_USERNAME /var/log/subscription-tracker
+sudo chown YOUR_USERNAME:YOUR_USERNAME /var/log/services
 ```
 Enable and start the service:
 ```
@@ -116,7 +116,7 @@ sudo systemctl status subscription-tracker
 ```
 To view the logs in real-time:
 ```
-tail -f /var/log/subscription-tracker/output.log
+tail -f /var/log/services/subtracker.log
 ```
 Some useful systemd commands:
 ```
@@ -137,18 +137,19 @@ chmod 600 /home/YOUR_USERNAME/leo-subscribers/.env
 ```
 Consider setting up log rotation to prevent the logs from growing too large:
 ```
-sudo nano /etc/logrotate.d/subscription-tracker
+sudo nano /etc/logrotate.d/services
 ```
 Add this content to the file:
 ```
-/var/log/subscription-tracker/*.log {
+/var/log/services/*.log {
     daily
     rotate 7
     compress
     delaycompress
     missingok
     notifempty
-    create 0640 YOUR_USERNAME YOUR_USERNAME
+    create 0640 syslog adm
+    copytruncate
 }
 ```
 
